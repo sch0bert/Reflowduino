@@ -1,23 +1,8 @@
 /*
- * Title: Reflowduino ESP32 Demo
- * Author: Timothy Woo
- * Website: www.botletics.com
- * Last modified: 7/23/2019
- * 
- * -----------------------------------------------------------------------------------------------
- * This is an example sketch for the Reflowduino32 'backpack' for DOIT ESP32 dev boards. The ESP32
- * and backpack board are meant to be used in conjunction with the Sidekick relay module. The default
- * settings in this code is for lead-free solder found in most solder paste, but the parameters
- * can be changed or added to suit your exact needs. The code implements temperature PID control
- * to follow the desired temperature profile and uses Bluetooth Low Energy (BLE) to communicate
- * the readings to the Reflowdiuno app.
- * 
- * Order a Reflowduino, ESP32 'backpack', or Sidekick relay module at https://www.botletics.com/products
- * Full documentation and design resources can be found at https://github.com/botletics/Reflowduino
- * 
- * -----------------------------------------------------------------------------------------------
- * Credits: Special thanks to all those who have been an invaluable part of the DIY community,
- * like the author of the Arduino PID library and the developers at Adafruit!
+ * Title: Reflowduino ESP32 modified
+ * Author: Pascal Sch0bert
+ * Website: https://www.linkedin.com/in/sch0bert/
+ * Last modified: 08/02/2022
  * 
  * -----------------------------------------------------------------------------------------------
  * License: This code is released under the GNU General Public License v3.0
@@ -37,8 +22,12 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-BLECharacteristic *pCharacteristic;
+BLEServer *pServer = NULL;
+BLEService *pService = NULL;
+BLECharacteristic *pCharacteristic = NULL;
+
 bool deviceConnected = false;
+bool previousDeviceConnected = false;
 float txValue = 0;
 
 // See the following for generating UUIDs:
@@ -47,26 +36,22 @@ float txValue = 0;
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// Libraries for MAX31855 thermocouple interface
-#include <SPI.h>
-SPIClass SPI2(HSPI); // We are using HSPI pins on the ESP32
-
-#include "Adafruit_MAX31855.h" // https://github.com/adafruit/Adafruit-MAX31855-library
+#include "max6675.h"
 
 // Library for PID control
 #include <PID_v1.h> // https://github.com/br3ttb/Arduino-PID-Library
 
 // Define pins
-#define relay 13
-#define LED 2 // This LED is used to indicate if the reflow process is underway
-#define MAX_CLK 14 // MAX31855 clock pin
-#define MAX_CS 27 // MAX31855 chip select pin
-#define MAX_DO 12 // MAX31855 data pin (HSPI MISO on ESP32)
+#define relay 15
+#define fan 13
+#define thermoDO  19
+#define thermoCS  23
+#define thermoCLK  5
 
 // Initialize Bluetooth software serial
 
 // Initialize thermocouple
-Adafruit_MAX31855 thermocouple(MAX_CLK, MAX_CS, MAX_DO);
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
 // Define reflow temperature profile parameters (in *C)
 // If needed, define a subtraction constant to compensate for overshoot:
@@ -74,11 +59,16 @@ Adafruit_MAX31855 thermocouple(MAX_CLK, MAX_CS, MAX_DO);
 
 // Standard lead-free solder paste (melting point around 215*C)
 //#define T_preheat 150
-//#define T_soak 217
-//#define T_reflow 249 - T_const
+//#define T_soak 183
+//#define T_reflow 235 - T_const
+
+// Straight line up to reflow (melting point around 215*C)
+//#define T_preheat 140
+//#define T_soak 150
+//#define T_reflow 160
 
 // "Low-temp" lead-free solder paste (melting point around 138*C)
-#define T_preheat 90
+#define T_preheat 100
 #define T_soak 138
 #define T_reflow 165 - T_const
 
@@ -87,7 +77,7 @@ Adafruit_MAX31855 thermocouple(MAX_CLK, MAX_CS, MAX_DO);
 //#define T_soak 80
 //#define T_reflow 100 - T_const
 
-#define T_cool 40 // Safe temperature at which the board is "ready" (dinner bell sounds!)
+#define T_cool 50 // Safe temperature at which the board is "ready" (dinner bell sounds!)
 #define preheat_rate 2 // Increase of 1-3 *C/s
 #define soak_rate 0.7 // Increase of 0.5-1 *C/s
 #define reflow_rate 2 // Increase of 1-3 *C/s
@@ -97,23 +87,28 @@ Adafruit_MAX31855 thermocouple(MAX_CLK, MAX_CS, MAX_DO);
 // but these values should be good enough to get you started
 #define PID_sampleTime 1000 // 1000ms = 1s
 // Preheat phase
-#define Kp_preheat 150
+#define Kp_preheat 300
 #define Ki_preheat 0
-#define Kd_preheat 100
+#define Kd_preheat 25
 // Soak phase
-#define Kp_soak 200
-#define Ki_soak 0.05
-#define Kd_soak 300
+#define Kp_soak 400
+#define Ki_soak 1
+#define Kd_soak 250
 // Reflow phase
-#define Kp_reflow 300
-#define Ki_reflow 0.05
-#define Kd_reflow 350
+#define Kp_reflow 350
+#define Ki_reflow 0
+#define Kd_reflow 100
 
 // Bluetooth app settings. Define which characters belong to which functions
 #define dataChar "*" // App is receiving data from Reflowduino
 #define stopChar "!" // App is receiving command to stop reflow process (process finished!)
 #define startReflow "A" // Command from app to "activate" reflow process
 #define stopReflow "S" // Command from app to "stop" reflow process at any time
+#define preheatStage "P" // Command for notifying what we are in preheat stage
+#define soakStage "K" // Command for notifying what we are in soak stage
+#define reflowStage "R" // Command for notifying what we are in soak stage
+#define coolStage "C" // Command for notifying what we are in cool down stage
+#define idleStage "I" // Command for notifying what we are in idle stage
 
 double temperature, output, setPoint; // Input, output, set point
 PID myPID(&temperature, &output, &setPoint, Kp_preheat, Ki_preheat, Kd_preheat, DIRECT);
@@ -125,6 +120,7 @@ bool preheatComplete = false;
 bool soakComplete = false;
 bool reflowComplete = false;
 bool coolComplete = false;
+bool coolBefore = false;
 
 double T_start; // Starting temperature before reflow process
 int windowSize = 2000;
@@ -132,6 +128,7 @@ unsigned long sendRate = 2000; // Send data to app every 2s
 unsigned long t_start = 0; // For keeping time during reflow process
 unsigned long previousMillis = 0;
 unsigned long duration, t_final, windowStartTime, timer;
+char txState[8];
 
 class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -177,12 +174,12 @@ void setup() {
   Serial.begin(115200);
 
 //  while (!Serial) delay(1); // OPTIONAL: Wait for serial to connect
-  Serial.println("*****Reflowduino ESP32 demo*****");
+  Serial.println("*****Reflowduino ESP32 modified*****");
 
-  pinMode(LED, OUTPUT);
+  pinMode(fan, OUTPUT);
   pinMode(relay, OUTPUT);
 
-  digitalWrite(LED, LOW);
+  digitalWrite(fan, LOW);
   digitalWrite(relay, LOW); // Set default relay state to OFF
 
   myPID.SetOutputLimits(0, windowSize);
@@ -194,11 +191,11 @@ void setup() {
   BLEDevice::init("Reflowduino32"); // Give it a name
 
   // Create the BLE Server
-  BLEServer *pServer = BLEDevice::createServer();
+  pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   // Create the BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pService = pServer->createService(SERVICE_UUID);
 
   // Create a BLE Characteristic
   pCharacteristic = pService->createCharacteristic(
@@ -219,18 +216,25 @@ void setup() {
   pService->start();
 
   // Start advertising
-  pServer->getAdvertising()->start();
+  //pServer->getAdvertising()->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID( SERVICE_UUID );
+  pAdvertising->setScanResponse( true );
+  pAdvertising->setMinPreferred( 0x06 ); // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred( 0x12 );
+  BLEDevice::startAdvertising();
   Serial.println("Waiting for a BLE client to connect...");
 }
 
 void loop() { 
   /***************************** REFLOW PROCESS CODE *****************************/
   if (reflow) {
-    digitalWrite(LED, HIGH); // Blue LED indicates reflow is underway
-
+    digitalWrite(fan, HIGH);
+    
     // This only runs when you first start the reflow process
     if (justStarted) {
       justStarted = false;
+      coolBefore = false;
       
       t_start = millis(); // Begin timers
       windowStartTime = millis();
@@ -259,6 +263,7 @@ void loop() {
         Serial.println("Preheat phase complete!");
       }
       else {
+        sprintf(txState, "%s", preheatStage);
         // Calculate the projected final time based on temperature points and temperature rates
         t_final = (T_preheat - T_start) / (preheat_rate / 1000.0) + t_start;
         // Calculate desired temperature at that instant in time using linear interpolation
@@ -273,6 +278,7 @@ void loop() {
         Serial.println("Soaking phase complete!");
       }
       else {
+        sprintf(txState, "%s", soakStage);
         t_final = (T_soak - T_start) / (soak_rate / 1000.0) + t_start;
         setPoint = duration * (T_soak - T_start) / (t_final - t_start);
       }
@@ -285,15 +291,18 @@ void loop() {
         Serial.println("Reflow phase complete!");
       }
       else {
+        sprintf(txState, "%s", reflowStage);
         t_final = (T_reflow - T_start) / (reflow_rate / 1000.0) + t_start;
         setPoint = duration * (T_reflow - T_start) / (t_final - t_start);
       }
     }
     /********************* COOLDOWN *********************/
     else if (!coolComplete) {
-      if (temperature <= T_cool) {
+      if (temperature <= T_cool && (coolBefore == false)) {
         coolComplete = true;
         reflow = false;
+        coolBefore = true;
+        digitalWrite(fan, LOW);
         Serial.println("PCB reflow complete!");
         
         // Tell the app that the entire process is finished!
@@ -301,6 +310,7 @@ void loop() {
         pCharacteristic->notify(); // Send value to the app
       }
       else {
+        sprintf(txState, "%s", coolStage);
         t_final = (T_cool - T_start) / (cool_rate / 1000.0) + t_start;
         setPoint = duration * (T_cool - T_start) / (t_final - t_start);
       }
@@ -318,7 +328,9 @@ void loop() {
     else digitalWrite(relay, LOW);
   }
   else {
-    digitalWrite(LED, LOW);
+
+    sprintf(txState, "%s", idleStage);    
+    digitalWrite(fan, LOW);
     digitalWrite(relay, LOW);
   }
 
@@ -326,6 +338,10 @@ void loop() {
   // Send data to the app periodically
   if (millis() - previousMillis > sendRate) {
     previousMillis = millis();
+
+    // Notify the stage we are running
+    pCharacteristic->setValue(txState);
+    pCharacteristic->notify(); // Send the value to the app
 
     /***************************** MEASURE TEMPERATURE *****************************/
     temperature = thermocouple.readCelsius(); // Read temperature
@@ -345,6 +361,21 @@ void loop() {
       
       pCharacteristic->setValue(txString);
       pCharacteristic->notify(); // Send the value to the app
+    }
+
+    // disconnecting
+    if ( !deviceConnected && previousDeviceConnected )
+    {
+      Serial.println( "Client disconnected." );
+      pServer->startAdvertising();
+      previousDeviceConnected = deviceConnected;
+    }
+    // connecting
+    if ( deviceConnected && !previousDeviceConnected )
+    {
+      // do stuff here on connecting
+      previousDeviceConnected = deviceConnected;
+      Serial.println( "Client connected." );
     }
   }
   // Commands sent from the app are checked in the callback function when they are received
